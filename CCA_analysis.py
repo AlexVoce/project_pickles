@@ -62,17 +62,17 @@ def finite_feature_mask(X):
     return np.isfinite(X).all(axis=0)
 
 
-def fit_scaler(X, Y, scale=True):
+def fit_scaler(X, scale=True):
     if not scale:
         return None, None, X, Y
-    scaler_x, scaler_y = StandardScaler(), StandardScaler()
-    return scaler_x, scaler_y, scaler_x.fit_transform(X), scaler_y.fit_transform(Y)
+    scaler_x = StandardScaler()
+    # not scaling zF because it is already z scored
+    return scaler_x, scaler_x.fit_transform(X)
 
 
-def apply_scaler(X, Y, scaler_x, scaler_y):
+def apply_scaler(X, scaler_x):
     X_z = scaler_x.transform(X) if scaler_x is not None else X
-    Y_z = scaler_y.transform(Y) if scaler_y is not None else Y
-    return X_z, Y_z
+    return X_z
 
 
 def fit_pca(X, Y, n_components=10):
@@ -273,8 +273,10 @@ def trial_cv_cca(
         X_train, X_test = X[train_idx], X[test_idx]
         Y_train, Y_test = Y[train_idx], Y[test_idx]
 
-        scaler_x, scaler_y, X_train_z, Y_train_z = fit_scaler(X_train, Y_train, scale=scale)
-        X_test_z, Y_test_z = apply_scaler(X_test, Y_test, scaler_x, scaler_y)
+        scaler_x, X_train_z = fit_scaler(X_train, scale=scale)
+        X_test_z = apply_scaler(X_test, scaler_x)
+        Y_train_z = Y_train  # not scaling zF because it is already z scored
+        Y_test_z = Y_test  # not scaling zF because it is already z scored
 
         pca_x, pca_y, X_train_final, Y_train_final = fit_pca(
             X_train_z, Y_train_z, n_components=n_pca_components,
@@ -344,6 +346,8 @@ def _fit_and_project(
     repeated name, or several -- correlations are always broken out per
     unique name present). Returns the per-run result dict documented on
     run_shared_cca (everything except `neuron_idx`/`config`, added by the caller).
+
+    IDK but zF data is already z scored, probably shouldnt scale again but npix needs scaling so just do that right? 
     """
     n_trials_total = X_trials.shape[0]
     names = list(dict.fromkeys(labels))  # unique, order of first appearance
@@ -369,7 +373,8 @@ def _fit_and_project(
     X_train_flat = X_train_flat[:, good_X]
     Y_train_flat = Y_train_flat[:, good_Y]
 
-    scaler_x, scaler_y, X_train_z, Y_train_z = fit_scaler(X_train_flat, Y_train_flat, scale=scale)
+    scaler_x, X_train_z = fit_scaler(X_train_flat, scale=scale)
+    Y_train_z = Y_train_flat[:, good_Y]  # not scaling zF because it is already z scored
     pca_x, pca_y, X_train_final, Y_train_final = fit_pca(
         X_train_z, Y_train_z, n_components=n_pca_components,
     )
@@ -396,7 +401,8 @@ def _fit_and_project(
     # project every trial (train + held-out) back through the fitted pipeline
     X_all_flat = flatten_trials(X_trials)[:, good_X]
     Y_all_flat = flatten_trials(Y_trials)[:, good_Y]
-    X_all_z, Y_all_z = apply_scaler(X_all_flat, Y_all_flat, scaler_x, scaler_y)
+    X_all_z = apply_scaler(X_all_flat, scaler_x)
+    Y_all_z = Y_all_flat[:, good_Y]  # not scaling zF because it is already z scored
     X_all_final, Y_all_final = apply_pca(X_all_z, Y_all_z, pca_x, pca_y)
     X_scores_flat, Y_scores_flat = cca.transform(X_all_final, Y_all_final)
 
@@ -441,7 +447,6 @@ def _fit_and_project(
     return {
         "cca": cca,
         "scaler_x": scaler_x,
-        "scaler_y": scaler_y,
         "pca_x": pca_x,
         "pca_y": pca_y,
         "good_X": good_X,
@@ -1018,6 +1023,7 @@ def plot_cca_scatter(
         (if show_centroids=True) plot_data["centroids"] holds the
         per-condition centroid coordinates.
     """
+    
     if agg not in ("trial_mean", "all_timepoints"):
         raise ValueError("agg must be 'trial_mean' or 'all_timepoints'.")
     if len(components) not in (2, 3):
