@@ -962,14 +962,20 @@ def plot_cca_scatter(
     cond_colours=None,    # per-condition colour: single colour, [c1, c2, ...], or {cond_name: colour}
     alpha=0.7,
     s=40,
+    show_centroids=False,     # also mark each condition's centroid (mean of its plotted points)
+    centroid_marker="X",
+    centroid_size=200,
+    centroid_edgecolor="black",
+    centroid_linewidth=1.5,
     figsize=(6, 6),
     title=None,
     ax=None,
 ):
     """
-    Scatter plot of trials in CC-space (components[0] vs components[1]),
-    coloured by condition. Requires fit="shared" (or comparable component
-    spaces) for the conditions to be meaningfully overlaid on the same axes.
+    Scatter plot of trials in CC-space (components[0] vs components[1], or
+    components[0] vs [1] vs [2] for a 3D scatter), coloured by condition.
+    Requires fit="shared" (or comparable component spaces) for the
+    conditions to be meaningfully overlaid on the same axes.
 
     Unlike plot_cca_state_space (one averaged trajectory per condition,
     coloured along its length by time), this shows the actual spread of
@@ -983,8 +989,11 @@ def plot_cca_scatter(
     which : {"X", "Y"}, default "X"
     fit : {"shared", "separate"}, optional
     conditions : sequence, optional
-    components : (int, int), default (0, 1)
-        Which two canonical components to use as the two axes.
+    components : (int, int) or (int, int, int), default (0, 1)
+        Which canonical components to use as plot axes. Pass two indices
+        for a 2D scatter or three (e.g. (0, 1, 2)) for a 3D scatter. If
+        `ax` is given for the 3D case, it must already have a 3D
+        projection (e.g. created with subplot_kw={"projection": "3d"}).
     agg : {"trial_mean", "all_timepoints"}, default "trial_mean"
         "trial_mean": one point per trial, averaged across its time window
         -- good for overall condition separation.
@@ -993,13 +1002,25 @@ def plot_cca_scatter(
     cond_colours : color, list, or dict, optional
         Per-condition colour, same shape rules as elsewhere in this module
         (single value, list cycled by order, or {cond_name: colour}).
+    show_centroids : bool, default False
+        If True, also plot each condition's centroid (mean of its plotted
+        points, computed after `agg`) as a larger marker on top of the
+        point cloud, in the same colour with a contrasting edge.
+    centroid_marker, centroid_size, centroid_edgecolor, centroid_linewidth :
+        Styling for the centroid markers (only used if show_centroids=True).
 
     Returns
     -------
     fig, ax, plot_data
+        plot_data["points"] holds the per-condition plotted points, and
+        (if show_centroids=True) plot_data["centroids"] holds the
+        per-condition centroid coordinates.
     """
     if agg not in ("trial_mean", "all_timepoints"):
         raise ValueError("agg must be 'trial_mean' or 'all_timepoints'.")
+    if len(components) not in (2, 3):
+        raise ValueError("components must have length 2 (2D) or 3 (3D).")
+    is_3d = len(components) == 3
 
     scores_by_cond = _scores_by_condition(cca_res, which=which, fit=fit)
 
@@ -1011,12 +1032,12 @@ def plot_cca_scatter(
     default_colours = plt.rcParams["axes.prop_cycle"].by_key()["color"]
     cond_colours = _resolve_per_condition(cond_colours, names, default_colours)
 
-    c0, c1 = components
-
     if ax is None:
-        fig, ax = plt.subplots(figsize=figsize)
+        fig, ax = plt.subplots(figsize=figsize, subplot_kw={"projection": "3d"} if is_3d else None)
     else:
         fig = ax.figure
+        if is_3d and not hasattr(ax, "zaxis"):
+            raise ValueError("3D components requires `ax` to have a 3D projection.")
 
     points_by_cond = {}
     for name in names:
@@ -1024,30 +1045,47 @@ def plot_cca_scatter(
             raise KeyError(f"Condition {name!r} not found in cca_res.")
         scores = scores_by_cond[name]  # (n_trials, n_time, n_components)
         n_components = scores.shape[-1]
-        if max(c0, c1) >= n_components:
+        if max(components) >= n_components:
             raise IndexError(
                 f"components={components} invalid for {name!r}: "
                 f"only {n_components} components available."
             )
 
+        idx = list(components)
         if agg == "trial_mean":
-            points = np.nanmean(scores[:, :, [c0, c1]], axis=1)  # (n_trials, 2)
+            points = np.nanmean(scores[:, :, idx], axis=1)  # (n_trials, n_dims)
         else:
-            points = scores[:, :, [c0, c1]].reshape(-1, 2)  # (n_trials * n_time, 2)
+            points = scores[:, :, idx].reshape(-1, len(idx))  # (n_trials * n_time, n_dims)
 
         ax.scatter(
-            points[:, 0], points[:, 1], color=cond_colours[name],
+            *[points[:, d] for d in range(points.shape[1])], color=cond_colours[name],
             alpha=alpha, s=s, label=name, edgecolor="none",
         )
         points_by_cond[name] = points
 
-    ax.set_xlabel(f"{which.upper()} CC{c0 + 1}")
-    ax.set_ylabel(f"{which.upper()} CC{c1 + 1}")
-    ax.set_title(title or f"{which.upper()} CC{c0 + 1} vs CC{c1 + 1}")
+    centroids_by_cond = None
+    if show_centroids:
+        centroids_by_cond = {name: np.nanmean(points_by_cond[name], axis=0) for name in names}
+        for name in names:
+            centroid = centroids_by_cond[name]
+            ax.scatter(
+                *[[centroid[d]] for d in range(len(centroid))], color=cond_colours[name],
+                marker=centroid_marker, s=centroid_size, edgecolor=centroid_edgecolor,
+                linewidth=centroid_linewidth, zorder=5,
+            )
+
+    axis_labels = [f"{which.upper()} CC{c + 1}" for c in components]
+    ax.set_xlabel(axis_labels[0])
+    ax.set_ylabel(axis_labels[1])
+    if is_3d:
+        ax.set_zlabel(axis_labels[2])
+    ax.set_title(title or " vs ".join(axis_labels))
     ax.legend(frameon=False)
     fig.tight_layout()
 
     plot_data = {"which": which, "components": components, "agg": agg, "points": points_by_cond}
+    if centroids_by_cond is not None:
+        plot_data["centroids"] = centroids_by_cond
     return fig, ax, plot_data
 
 
