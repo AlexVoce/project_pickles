@@ -45,6 +45,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import train_test_split, GroupKFold, StratifiedKFold, cross_validate
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
+from scipy.linalg import subspace_angles
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +643,7 @@ def run_shared_cca_per_zone(
         )
         for zone_id in zone_ids
     }
+
 
 import numpy as np
 import matplotlib.pyplot as plt
