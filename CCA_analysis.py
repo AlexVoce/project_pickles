@@ -38,6 +38,7 @@ feature masks used, and every trial's projection onto the shared components
 anything.
 """
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor
 
 from sklearn.cross_decomposition import CCA
 from sklearn.decomposition import PCA
@@ -46,6 +47,23 @@ from sklearn.model_selection import train_test_split, GroupKFold, StratifiedKFol
 from sklearn.pipeline import make_pipeline
 from sklearn.preprocessing import StandardScaler
 from scipy.linalg import subspace_angles
+
+_background_executor = ThreadPoolExecutor(max_workers=2)
+
+
+def run_in_background(fn, *args, **kwargs):
+    """
+    Submit fn(*args, **kwargs) to a background thread and return a
+    concurrent.futures.Future immediately, instead of blocking the
+    notebook. numpy/sklearn release the GIL during their heavy linear
+    algebra, so long CCA/PCA calls (e.g. time_lagged_cca) still make
+    progress while you keep working in other cells.
+
+    Check future.done(), or call future.result() to block until it
+    finishes and get the return value (re-raises any exception raised
+    inside fn).
+    """
+    return _background_executor.submit(fn, *args, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -64,7 +82,7 @@ def finite_feature_mask(X):
 
 def fit_scaler(X, scale=True):
     if not scale:
-        return None, None, X, Y
+        return None, X
     scaler_x = StandardScaler()
     # not scaling zF because it is already z scored
     return scaler_x, scaler_x.fit_transform(X)
@@ -647,6 +665,118 @@ def run_shared_cca_per_zone(
             conditions, zone=zone_id, neuron_zone=neuron_zone, **kwargs,
         )
         for zone_id in zone_ids
+    }
+
+
+# ---------------------------------------------------------------------------
+# Time-lagged CCA -- which area's signal leads the other
+# ---------------------------------------------------------------------------
+
+def time_lagged_cca(X_trials, Y_trials, lags, n_pca_components=None, n_cca_components=8,
+                     scale=True, test_size=0.2, random_state=42, verbose=True,
+                     max_iter=200):
+    """
+    Sweep CCA canonical-correlation strength across a time lag between X and
+    Y (e.g. cortex vs cerebellum), to test which area's signal leads.
+
+    For each lag tau (in SAMPLES along the shared time axis -- X_trials and
+    Y_trials must already be on the same time grid, e.g. npix_ds vs zF after
+    organise_dataset's downsampling):
+        tau > 0: pairs X's LATER timepoints with Y's EARLIER ones
+                 (X_trials[:, tau:], Y_trials[:, :-tau]) -- i.e. testing
+                 whether Y's past predicts X's present. Correlation peaking
+                 at tau > 0 means Y leads X.
+        tau < 0: the mirror pairing -- correlation peaking at tau < 0 means
+                 X leads Y.
+        tau = 0: the ordinary same-time fit (what run_shared_cca does).
+
+    A fresh scaler/[PCA]/CCA is refit at every lag, on the SAME held-out
+    trial split for every lag (so lags are only ever compared using
+    identical train/test trials, never confounded by different splits).
+    Refitting per lag (rather than reusing the tau=0 weights on shifted
+    data) matters because the optimal linear combination of neurons in each
+    area can genuinely differ once you change what timepoints are being
+    related to each other.
+
+    X_trials, Y_trials : (n_trials, n_time, n_features), same n_trials/n_time
+    lags : iterable of int sample-shifts (positive/negative/zero)
+    n_pca_components, n_cca_components, scale : as in run_shared_cca. Strongly
+        recommend setting n_pca_components (e.g. 20-30) rather than None here
+        specifically -- sklearn's CCA is fit by NIPALS, an iterative
+        algorithm with no closed form for n_components > 1, and its
+        per-iteration cost scales with raw feature count. Refitting directly
+        on hundreds of raw neurons at every lag (rather than a PCA-reduced
+        version) is the dominant cost of this function by a large margin --
+        each lag can take minutes instead of seconds. PCA-reducing first
+        also tends to help convergence itself: at lags far from the true
+        lead/lag relationship, X and Y are only weakly related, and NIPALS
+        can grind for many iterations failing to find a stable direction in
+        raw high-dimensional space.
+    test_size : held-out fraction of TRIALS (same split reused across lags)
+    max_iter : CCA NIPALS iteration cap per component (default 200, well
+        below sklearn's own default of 500 -- this function refits at every
+        lag, so a lag with weak/no real correlation has no dominant
+        direction to converge onto and will otherwise burn the full cap
+        every single time; capping it low bounds the per-lag worst case
+        without changing the (still noisy/near-zero) correlation such a lag
+        reports).
+
+    Returns
+    -------
+    dict with:
+        lags          (n_lags,) the lags actually used, sorted (a lag is
+                      skipped -- with a printed warning -- if fewer than 5
+                      timepoints would remain after shifting)
+        test_corrs    {lag: (n_components,) held-out canonical correlations}
+        train_corrs   {lag: (n_components,) train-set canonical correlations}
+    """
+    n_trials, n_time = X_trials.shape[0], X_trials.shape[1]
+    train_idx, test_idx = train_test_split(
+        np.arange(n_trials), test_size=test_size, random_state=random_state,
+    )
+
+    test_corrs, train_corrs = {}, {}
+    for tau in sorted(lags):
+        if tau >= 0:
+            X_shift, Y_shift = X_trials[:, tau:, :], Y_trials[:, :n_time - tau, :]
+        else:
+            X_shift, Y_shift = X_trials[:, :n_time + tau, :], Y_trials[:, -tau:, :]
+
+        if X_shift.shape[1] < 5:
+            print(f"[time_lagged_cca] skipping lag {tau}: only {X_shift.shape[1]} timepoints left.")
+            continue
+
+        X_train_flat = flatten_trials(X_shift[train_idx])
+        Y_train_flat = flatten_trials(Y_shift[train_idx])
+        good_X = finite_feature_mask(X_train_flat)
+        good_Y = finite_feature_mask(Y_train_flat)
+        X_train_flat, Y_train_flat = X_train_flat[:, good_X], Y_train_flat[:, good_Y]
+
+        scaler_x, X_train_z = fit_scaler(X_train_flat, scale=scale)
+        Y_train_z = Y_train_flat  # not scaled here either, matching run_shared_cca's convention
+        pca_x, pca_y, X_train_final, Y_train_final = fit_pca(X_train_z, Y_train_z, n_components=n_pca_components)
+
+        n_comp = min(n_cca_components, X_train_final.shape[1], Y_train_final.shape[1])
+        cca = CCA(n_components=n_comp, max_iter=max_iter)
+        cca.fit(X_train_final, Y_train_final)
+        X_train_scores, Y_train_scores = cca.transform(X_train_final, Y_train_final)
+        train_corrs[tau] = canonical_corrs(X_train_scores, Y_train_scores)
+
+        X_test_flat = flatten_trials(X_shift[test_idx])[:, good_X]
+        Y_test_flat = flatten_trials(Y_shift[test_idx])[:, good_Y]
+        X_test_z = apply_scaler(X_test_flat, scaler_x)
+        X_test_final, Y_test_final = apply_pca(X_test_z, Y_test_flat, pca_x, pca_y)
+        X_test_scores, Y_test_scores = cca.transform(X_test_final, Y_test_final)
+        test_corrs[tau] = canonical_corrs(X_test_scores, Y_test_scores)
+
+        if verbose:
+            print(f"lag={tau:+3d} ({X_shift.shape[1]} timepoints): "
+                  f"train CC1={train_corrs[tau][0]:.3f}, test CC1={test_corrs[tau][0]:.3f}")
+
+    return {
+        "lags": np.array(sorted(test_corrs.keys())),
+        "test_corrs": test_corrs,
+        "train_corrs": train_corrs,
     }
 
 
@@ -1361,33 +1491,116 @@ def plot_cca_cv_correlations(
 # Linear decoding from CCA space (e.g. Left vs Right)
 # ---------------------------------------------------------------------------
 
+import numpy as np
+from sklearn.model_selection import StratifiedKFold
+
+
+# ---------------------------------------------------------------- helper 1/3
+def _scores_by_condition(cca_res, which="X", fit=None):
+    """
+    Normalize shared/separate cca_res into {name: (n_trials, n_time, n_components)}
+    for the requested variate (`which` = "X" i.e. npix, or "Y" i.e. zF).
+    """
+    which = which.upper()
+    if which not in ("X", "Y"):
+        raise ValueError("which must be 'X' or 'Y'.")
+
+    if fit is None:
+        fit = "separate" if "per_condition" in cca_res else "shared"
+
+    if fit == "shared":
+        return cca_res[f"{which}_scores_by_cond"]
+
+    score_key = f"{which}_scores"
+    return {name: block[score_key] for name, block in cca_res["per_condition"].items()}
+
+
+# ---------------------------------------------------------------- helper 2/3
+def _fit_lda(X, y, shrinkage):
+    """
+    Closed-form two-class Fisher LDA (shared, ridge-regularized covariance),
+    fit independently per timepoint but vectorized across all of them at once.
+
+    X : (n_trials, n_time, n_comp)
+    y : (n_trials,) 0/1
+    Returns w (n_time, n_comp) discriminant weight vector and threshold
+    (n_time,); score = X @ w - threshold, score > 0 => class 1. Equivalent to
+    sklearn's LinearDiscriminantAnalysis decision_function up to the ridge
+    term, without the per-timepoint object/fit overhead.
+    """
+    X0, X1 = X[y == 0], X[y == 1]
+    n0, n1 = len(X0), len(X1)
+    mean0, mean1 = X0.mean(0), X1.mean(0)  # (n_time, n_comp)
+    c0, c1 = X0 - mean0, X1 - mean1
+    Sw = np.einsum("itc,itd->tcd", c0, c0) + np.einsum("itc,itd->tcd", c1, c1)
+    Sw /= (n0 + n1 - 2)
+    n_comp = Sw.shape[-1]
+    ridge = shrinkage * np.trace(Sw, axis1=1, axis2=2) / n_comp
+    Sw += ridge[:, None, None] * np.eye(n_comp)
+
+    diff = mean1 - mean0  # (n_time, n_comp)
+    w = np.linalg.solve(Sw, diff[..., None])[..., 0]  # (n_time, n_comp)
+    threshold = np.einsum("tc,tc->t", w, (mean0 + mean1) / 2) - np.log(n1 / n0)
+    return w, threshold
+
+
+def _lda_scores(X_train, y_train, X_test, shrinkage):
+    """
+    Fit _fit_lda on the training split and score the held-out trials.
+
+    X_train, X_test : (n_trials, n_time, n_comp)
+    y_train          : (n_trials,) 0/1
+    Returns held-out decision scores, (n_test, n_time); score > 0 => class 1.
+    """
+    w, threshold = _fit_lda(X_train, y_train, shrinkage)
+    return np.einsum("itc,tc->it", X_test, w) - threshold  # (n_test, n_time)
+
+
+# ---------------------------------------------------------------- helper 3/3
+def _fast_auc(scores, y_test):
+    """Vectorized rank-sum ROC AUC across all columns (timepoints) of `scores`."""
+    ranks = np.argsort(np.argsort(scores, axis=0), axis=0) + 1  # ties broken arbitrarily
+    pos = y_test == 1
+    n1 = pos.sum()
+    n0 = len(y_test) - n1
+    u = ranks[pos].sum(axis=0) - n1 * (n1 + 1) / 2
+    return u / (n0 * n1)
+
+
+# ---------------------------------------------------------------- main
 def decode_cca_condition(
     cca_res,
     group_a,               # condition name, or list of names, pooled as class 0 (e.g. "Left" side)
     group_b,               # condition name, or list of names, pooled as class 1 (e.g. "Right" side)
     which="X",
     fit=None,
-    reg_method="logistic",  # "logistic", "ridge", "svm" (linear), "svm_rbf",
-                             # "random_forest", or "xgboost"
-    reg_kwargs=None,        # extra kwargs passed to the chosen estimator's constructor
+    reg_method="lda",      # kept for backward compatibility; only "lda" is supported
     scale=True,             # z-score each component across trials before decoding
     components=None,       # canonical components to use as decoder features; None = every available one
     balance_conditions=True,  # if True, subsample the larger group to match the smaller one (per timepoint)
     n_splits=5,
     n_permutations=0,      # if > 0, also builds a label-shuffled null accuracy distribution per timepoint
+    shrinkage=1e-3,         # ridge added to the pooled covariance, relative to its trace (numerical safety)
     random_state=42,
     verbose=True,
 ):
     """
-    Time-resolved linear decoding of a binary condition split (e.g. Left vs
+    Time-resolved LDA decoding of a binary condition split (e.g. Left vs
     Right) from the CCA canonical-variate scores. At every timepoint, fits
-    a cross-validated logistic regression on that timepoint's per-trial
+    a cross-validated linear discriminant on that timepoint's per-trial
     canonical scores (n_trials, n_components) and reports held-out
     accuracy/AUC -- i.e. how linearly separable the two groups are in CC
     space at that point in the trial. This is independent of (and answers a
     different question from) the X/Y canonical correlation itself: two
     conditions can be strongly correlated between X and Y while still being
     totally inseparable from each other in that same space, or vice versa.
+
+    The two-class LDA has a closed form (pooled-covariance Mahalanobis
+    discriminant), computed here directly in numpy and vectorized across all
+    timepoints and CV folds at once, instead of fitting scikit-learn's
+    LinearDiscriminantAnalysis independently per timepoint. This avoids
+    per-fit estimator/pipeline overhead and is the dominant cost when
+    n_permutations is large, so it's dramatically faster for the same result.
 
     group_a / group_b : str or list of str
         Condition name(s) (as they appear in cca_res) to pool as each
@@ -1399,27 +1612,19 @@ def decode_cca_condition(
         mode) so group_a/group_b sit in the same component space --
         decoding across a "separate" fit's per-condition spaces isn't
         meaningful.
-    reg_method : {"logistic", "ridge", "svm", "svm_rbf", "random_forest", "xgboost", "LDA"}, default "logistic"
-        Classifier fit at each timepoint. "logistic", "ridge", and "svm"
-        (linear-kernel SVC) are linear decoders -- their held-out
-        accuracy/AUC is directly comparable to the linear CCA structure.
-        "svm_rbf", "random_forest", and "xgboost" are nonlinear and can
-        pick up separability a linear boundary would miss; a gap between a
-        linear and nonlinear decoder's accuracy at the same timepoint is
-        itself informative. "xgboost" requires the xgboost package.
-    reg_kwargs : dict, optional
-        Extra constructor kwargs for the chosen estimator (e.g.
-        reg_method="random_forest", reg_kwargs={"n_estimators": 500}).
     components : sequence of int, optional
         Zero-based canonical-component indices to use as decoder features.
         None = every available component.
     n_splits : int, default 5
         StratifiedKFold folds for the held-out accuracy/AUC at each timepoint.
     n_permutations : int, default 0
-        If > 0, also fits `n_permutations` label-shuffled decoders per
-        timepoint to build a null accuracy distribution (for a chance band
-        -- see plot_decode_accuracy). Cost scales linearly with this, so
-        keep it modest (e.g. 100-500) unless you have time to spare.
+        If > 0, also builds a label-shuffled null accuracy distribution
+        (for a chance band -- see plot_decode_accuracy), reusing the same
+        CV train/test partition as the real fit for each shuffle.
+    shrinkage : float, default 1e-3
+        Ridge regularization added to the pooled within-class covariance
+        (relative to its trace), for numerical stability when components
+        are correlated or trial counts are small.
 
     Returns
     -------
@@ -1430,46 +1635,10 @@ def decode_cca_condition(
         labels                              (n_trials,) 0/1 group labels used (0=group_a, 1=group_b)
         group_a, group_b, components, which, n_time
     """
-    from sklearn.model_selection import StratifiedKFold, cross_validate
-    from sklearn.linear_model import LogisticRegression, RidgeClassifier
-    from sklearn.svm import SVC
-    from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-    from sklearn.ensemble import RandomForestClassifier
-    from sklearn.preprocessing import StandardScaler
-    from sklearn.pipeline import make_pipeline
+    if reg_method.lower() != "lda":
+        raise ValueError(f"reg_method={reg_method!r} no longer supported; this decoder is LDA-only.")
 
-    def make_decoder():
-        kwargs = dict(reg_kwargs) if reg_kwargs else {}
-        method = reg_method.lower()
-        if method == "logistic":
-            base = LogisticRegression(max_iter=1000, random_state=random_state, **kwargs)
-        elif method == "ridge":
-            base = RidgeClassifier(random_state=random_state, **kwargs)
-        elif method in ("svm", "svm_linear"):
-            base = SVC(kernel="linear", random_state=random_state, **kwargs)
-        elif method == "lda":
-            base = LinearDiscriminantAnalysis(**kwargs)
-        elif method == "svm_rbf":
-            base = SVC(kernel="rbf", random_state=random_state, **kwargs)
-        elif method in ("rf", "random_forest"):
-            base = RandomForestClassifier(n_estimators=200, random_state=random_state, **kwargs)
-        elif method == "xgboost":
-            try:
-                from xgboost import XGBClassifier
-            except ImportError as exc:
-                raise ImportError(
-                    "reg_method='xgboost' requires the xgboost package (pip install xgboost)."
-                ) from exc
-            base = XGBClassifier(
-                n_estimators=200, max_depth=3, learning_rate=0.1,
-                eval_metric="logloss", random_state=random_state, n_jobs=1, **kwargs,
-            )
-        else:
-            raise ValueError(
-                f"Unknown reg_method {reg_method!r}; expected 'logistic', 'ridge', "
-                f"'svm', 'svm_rbf', 'random_forest', 'LDA', or 'xgboost'."
-            )
-        return make_pipeline(StandardScaler(), base) if scale else base
+    from sklearn.model_selection import StratifiedKFold
 
     scores_by_cond = _scores_by_condition(cca_res, which=which, fit=fit)
 
@@ -1497,37 +1666,40 @@ def decode_cca_condition(
 
     n_time, n_components_avail = X_all.shape[1], X_all.shape[2]
     comp_idx = np.arange(n_components_avail) if components is None else np.asarray(components)
+    X_all = X_all[:, :, comp_idx]  # (n_trials, n_time, n_comp)
+
+    if scale:
+        sd = X_all.std(axis=0, keepdims=True)
+        X_all = (X_all - X_all.mean(axis=0, keepdims=True)) / np.where(sd == 0, 1, sd)
 
     if verbose:
         print(
             f"Decoding {group_a} (n={len(X_a)}) vs {group_b} (n={len(X_b)}) "
-            f"from {which.upper()} CC{list(comp_idx + 1)}, {n_time} timepoints, "
-            f"reg_method={reg_method!r}."
+            f"from {which.upper()} CC{list(comp_idx + 1)}, {n_time} timepoints, LDA."
         )
 
-    cv = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
-    rng = np.random.default_rng(random_state)
+    folds = list(StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state).split(y, y))
 
-    time_accuracy = np.full(n_time, np.nan)
-    time_accuracy_std = np.full(n_time, np.nan)
-    time_auc = np.full(n_time, np.nan)
-    time_auc_std = np.full(n_time, np.nan)
-    null_accuracy = np.full((n_permutations, n_time), np.nan) if n_permutations else None
+    def fold_scores(y_labels):
+        """(n_splits, n_time) accuracy and AUC, one row per CV fold."""
+        accs, aucs = np.empty((n_splits, n_time)), np.empty((n_splits, n_time))
+        for i, (train_idx, test_idx) in enumerate(folds):
+            scores = _lda_scores(X_all[train_idx], y_labels[train_idx], X_all[test_idx], shrinkage)
+            y_test = y_labels[test_idx]
+            accs[i] = ((scores > 0).astype(int) == y_test[:, None]).mean(axis=0)
+            aucs[i] = _fast_auc(scores, y_test)
+        return accs, aucs
 
-    for ti in range(n_time):
-        feats = X_all[:, ti, :][:, comp_idx]
-        clf = make_decoder()
+    accs, aucs = fold_scores(y)
+    time_accuracy, time_accuracy_std = accs.mean(0), accs.std(0)
+    time_auc, time_auc_std = aucs.mean(0), aucs.std(0)
 
-        cv_res = cross_validate(clf, feats, y, cv=cv, scoring=["accuracy", "roc_auc"])
-        time_accuracy[ti] = cv_res["test_accuracy"].mean()
-        time_accuracy_std[ti] = cv_res["test_accuracy"].std()
-        time_auc[ti] = cv_res["test_roc_auc"].mean()
-        time_auc_std[ti] = cv_res["test_roc_auc"].std()
-
+    null_accuracy = None
+    if n_permutations:
+        rng = np.random.default_rng(random_state)
+        null_accuracy = np.empty((n_permutations, n_time))
         for p in range(n_permutations):
-            y_perm = rng.permutation(y)
-            perm_res = cross_validate(clf, feats, y_perm, cv=cv, scoring="accuracy")
-            null_accuracy[p, ti] = perm_res["test_score"].mean()
+            null_accuracy[p] = fold_scores(rng.permutation(y))[0].mean(0)
 
     return {
         "time_accuracy": time_accuracy,
@@ -1536,7 +1708,79 @@ def decode_cca_condition(
         "time_auc_std": time_auc_std,
         "null_accuracy": null_accuracy,
         "labels": y,
-        "reg_method": reg_method,
+        "reg_method": "lda",
+        "group_a": group_a,
+        "group_b": group_b,
+        "components": comp_idx,
+        "which": which,
+        "n_time": n_time,
+    }
+
+
+def lda_axes(
+    cca_res,
+    group_a,
+    group_b,
+    which="Y",
+    fit=None,
+    components=None,
+    scale=False,
+    balance_conditions=True,
+    shrinkage=1e-3,
+    random_state=42,
+):
+    """
+    The time-resolved LDA discriminant axis (weight vector) itself, fit on
+    ALL (optionally balanced) trials -- no CV, no permutations. Use this to
+    inspect *what* the decoder in decode_cca_condition relies on (which
+    components carry the most weight, whether the axis rotates over time),
+    not to estimate held-out performance -- decode_cca_condition already
+    tells you whether an axis exists at all; this shows what it looks like.
+
+    Arguments mirror decode_cca_condition (see its docstring); there is no
+    n_splits/n_permutations since nothing here is cross-validated.
+
+    Returns
+    -------
+    dict with:
+        w            (n_time, n_comp) discriminant weight vector
+        threshold    (n_time,)
+        labels       (n_trials,) 0/1 group labels used (0=group_a, 1=group_b)
+        group_a, group_b, components, which, n_time
+    """
+    scores_by_cond = _scores_by_condition(cca_res, which=which, fit=fit)
+
+    group_a = [group_a] if isinstance(group_a, str) else list(group_a)
+    group_b = [group_b] if isinstance(group_b, str) else list(group_b)
+    for name in group_a + group_b:
+        if name not in scores_by_cond:
+            raise KeyError(f"Condition {name!r} not found in cca_res.")
+
+    X_a = np.concatenate([scores_by_cond[name] for name in group_a], axis=0)
+    X_b = np.concatenate([scores_by_cond[name] for name in group_b], axis=0)
+    if balance_conditions:
+        n_trials = min(len(X_a), len(X_b))
+        rng = np.random.default_rng(random_state)
+        X_a = rng.choice(X_a, size=n_trials, replace=False)
+        X_b = rng.choice(X_b, size=n_trials, replace=False)
+
+    X_all = np.concatenate([X_a, X_b], axis=0)  # (n_trials, n_time, n_components)
+    y = np.concatenate([np.zeros(len(X_a)), np.ones(len(X_b))]).astype(int)
+
+    n_time, n_components_avail = X_all.shape[1], X_all.shape[2]
+    comp_idx = np.arange(n_components_avail) if components is None else np.asarray(components)
+    X_all = X_all[:, :, comp_idx]
+
+    if scale:
+        sd = X_all.std(axis=0, keepdims=True)
+        X_all = (X_all - X_all.mean(axis=0, keepdims=True)) / np.where(sd == 0, 1, sd)
+
+    w, threshold = _fit_lda(X_all, y, shrinkage)
+
+    return {
+        "w": w,
+        "threshold": threshold,
+        "labels": y,
         "group_a": group_a,
         "group_b": group_b,
         "components": comp_idx,
@@ -1637,6 +1881,7 @@ def plot_cca_scree(
     split="train",         # "train", "test", or "both" -- which fitted correlations to show
     cond_colours=None,     # per-condition line colour: single colour, [c1, c2, ...], or {cond_name: colour}
     figsize=(7, 5),
+    avg_conds=False,          # if True, average across conditions per component and plot a single line
     title=None,
     ax=None,
 ):
@@ -1674,6 +1919,10 @@ def plot_cca_scree(
         raise ValueError("split must be 'train', 'test', or 'both'.")
 
     corrs_by_cond = _final_corrs_by_condition(cca_res, fit=fit)
+    if avg_conds:
+        avg_train = np.nanmean([block["train"] for block in corrs_by_cond.values()], axis=0)
+        avg_test = np.nanmean([block.get("test") for block in corrs_by_cond.values() if block.get("test") is not None], axis=0)
+        corrs_by_cond = {"Average": {"train": avg_train, "test": avg_test}}
 
     if conditions is None:
         names = list(corrs_by_cond.keys())

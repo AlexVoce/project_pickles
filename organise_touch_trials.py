@@ -4,8 +4,7 @@ organise_touch_trials.py
 organises touchDict's per-trial imaging time series (zF_touchMat, npix_touchMat)
 by trial condition (cue side x correct/incorrect x 1port/2port, from
 touchDict['trialTypeInds']), downsampling npix_touchMat onto the same time
-grid as zF_touchMat, and (optionally) wrapping everything in pynapple objects
-so you get restrict()/mean()/plotting for free.
+grid as zF_touchMat
 
 ASSUMPTIONS:
   - zF_touchMat and npix_touchMat both have a trial axis of length n_trials
@@ -45,13 +44,6 @@ from typing import Optional
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
-
-try:
-    import pynapple as nap
-    HAVE_PYNAPPLE = True
-except ImportError:
-    HAVE_PYNAPPLE = False
-
 
 # --------------------------------------------------------------------------
 # Low-level helpers
@@ -164,6 +156,227 @@ def orient_trial_time_feature(zF: np.ndarray, npixMat: np.ndarray, n_trials: int
 
 
 _warned_meta_mismatch = set()
+_warned_meta_missing = set()
+
+
+_COND_NAME_RE = __import__('re').compile(
+    r'^i?Cue(L|R|LR)_(?:(\d+)port|(L|R)port)_(cor|inc)$'
+)
+_OPPOSITE_SIDE = {'L': 'R', 'R': 'L'}
+
+
+def parse_condition_name(cond_name: str) -> Optional[dict]:
+    """
+    Parse a trialTypeInds condition name into its cueSide/portSide/rewardSide/
+    correct components, e.g.:
+      - 'iCueL_1port_cor'   -> cue names the rewarded port (L); 'cor' means the
+        animal touched that same port, 'inc' means it touched the other one.
+        {cueSide: 'L', portSide: 'L', rewardSide: 'L', correct: True}
+      - 'iCueR_2port_inc'   -> cue was R, animal touched the other (L) port.
+        {cueSide: 'R', portSide: 'L', rewardSide: 'R', correct: False}
+      - 'iCueLR_Lport_cor'  -> ambiguous cue (both sides), animal touched L and
+        that was the rewarded port this trial.
+        {cueSide: 'LR', portSide: 'L', rewardSide: 'L', correct: True}
+      - 'iCueLR_Rport_inc'  -> ambiguous cue, animal touched R but L was
+        actually rewarded this trial.
+        {cueSide: 'LR', portSide: 'R', rewardSide: 'L', correct: False}
+    Returns None if `cond_name` doesn't match the expected naming convention
+    (e.g. a custom/pooled condition name).
+    """
+    m = _COND_NAME_RE.match(cond_name)
+    if m is None:
+        return None
+    cue, _nport, explicit_port, outcome = m.groups()
+    correct = (outcome == 'cor')
+
+    if explicit_port is not None:
+        # ambiguous "LR" cue -- the named port is the one the animal touched;
+        # it was rewarded iff this trial is marked correct.
+        portSide = explicit_port
+        rewardSide = portSide if correct else _OPPOSITE_SIDE[portSide]
+        cueSide = 'LR'
+    else:
+        # 1port/2port -- cue itself names the rewarded port; the animal
+        # touched it (correct) or the other port (incorrect).
+        cueSide = cue
+        rewardSide = cue
+        portSide = cue if correct else _OPPOSITE_SIDE[cue]
+
+    return {'cueSide': cueSide, 'portSide': portSide, 'rewardSide': rewardSide, 'correct': correct}
+
+
+def derive_side_meta_from_trialTypeInds(trialTypeInds: dict, n_trials: int):
+    """
+    Build per-trial cueSide/portSide/rewardSide arrays by parsing each
+    trialTypeInds condition name (see parse_condition_name) and scattering its
+    trial indices into the output arrays. Used as a fallback when
+    seshParams doesn't carry these fields directly. Trials not covered by any
+    parseable condition (e.g. dropped/aborted trials, or conditions with a
+    non-standard name) are left as None.
+    """
+    cueSide = np.full(n_trials, None, dtype=object)
+    portSide = np.full(n_trials, None, dtype=object)
+    rewardSide = np.full(n_trials, None, dtype=object)
+    for cond_name, idx in trialTypeInds.items():
+        parsed = parse_condition_name(cond_name)
+        if parsed is None:
+            continue
+        idx = np.asarray(idx, dtype=int)
+        idx = idx[idx < n_trials]
+        cueSide[idx] = parsed['cueSide']
+        portSide[idx] = parsed['portSide']
+        rewardSide[idx] = parsed['rewardSide']
+    return cueSide, portSide, rewardSide
+
+
+def get_optional_meta(sp: dict, key: str, n_trials: int,
+                       derived: Optional[np.ndarray] = None) -> np.ndarray:
+    """
+    Fetch a per-trial seshParams array (cueSide, portSide, rewardSide, ...) if
+    present. If missing, use `derived` (e.g. from
+    derive_side_meta_from_trialTypeInds) if given, otherwise fall back to an
+    all-None array of length n_trials. Warns once per key either way. Some
+    touchDicts don't carry these fields at all (e.g. sessions where cue side
+    wasn't logged separately), and organise_dataset() shouldn't hard-crash on
+    that -- the actual signals (zF/npix) are unaffected.
+    """
+    if key in sp:
+        return np.asarray(sp[key])
+
+    if key not in _warned_meta_missing:
+        if derived is not None:
+            print(
+                f"[organise_touch_trials] WARNING: seshParams['{key}'] is missing from this "
+                f"touchDict. Derived it from trialTypeInds condition names instead "
+                "(e.g. 'iCueR_1port_cor' -> cueSide='R') -- double check this matches your "
+                "task's actual convention."
+            )
+        else:
+            print(
+                f"[organise_touch_trials] WARNING: seshParams['{key}'] is missing from this "
+                f"touchDict, and it could not be derived from trialTypeInds condition names. "
+                f"Filling with None for all {n_trials} trials -- the actual signals (zF/npix) "
+                "are unaffected."
+            )
+        _warned_meta_missing.add(key)
+
+    return derived if derived is not None else np.full(n_trials, None, dtype=object)
+
+
+def _match_trialOnT_to_touches(trialOnT: np.ndarray, touchT: np.ndarray, rxnT: np.ndarray,
+                                tol: float, start: int = 0) -> Optional[np.ndarray]:
+    """
+    Greedy walk: consume touchT/rxnT in order, matching each to the next
+    trialOnT[i] (i >= start) for which touchT[j] ~= trialOnT[i] + baseline + rxnT[j],
+    within `tol` seconds. `baseline` isn't assumed constant -- it's bootstrapped
+    from the first match and re-estimated after every match, to track slow
+    session clock drift. Trials that don't match within tol are treated as
+    aborted (no touch) and skipped without consuming a touchT/rxnT entry.
+    Returns the matched trialOnT indices (len == len(touchT)), or None if not
+    all of touchT could be accounted for.
+    """
+    ptr = 0
+    baseline_est = None
+    matched = []
+    for i in range(start, len(trialOnT)):
+        if ptr >= len(touchT):
+            break
+        if baseline_est is None:
+            baseline_est = touchT[ptr] - trialOnT[i] - rxnT[ptr]
+        predicted = trialOnT[i] + baseline_est + rxnT[ptr]
+        if abs(touchT[ptr] - predicted) < tol:
+            matched.append(i)
+            baseline_est = touchT[ptr] - trialOnT[i] - rxnT[ptr]
+            ptr += 1
+    return np.array(matched, dtype=int) if ptr == len(touchT) else None
+
+
+def resolve_aborted_trials(touchDict: dict, touch_key: str = 'tTouchGlobal',
+                            rxn_key: str = 'tRxnPerTrial', tol: float = 0.5,
+                            max_bootstrap_shift: int = 5) -> dict:
+    """
+    Fixes touchDicts where seshParams['trialOnT'] has MORE entries than
+    zF_touchMat/npix_touchMat's trial axis. The extra entries are trials the
+    mouse never reached on (aborted -- no touch, so no imaging window was
+    extracted for them), while `touchDict[touch_key]` / `touchDict[rxn_key]`
+    (touch time / reaction time) only cover the trials that were actually
+    touched, in the same temporal order as trialOnT and 1:1 with
+    zF_touchMat/npix_touchMat's rows.
+
+    Reconstructs which trialOnT entries have a touch by matching
+    touchT[j] ~= trialOnT[i] + baseline + rxnT[j] walking both arrays in order
+    (see _match_trialOnT_to_touches) -- `baseline` (session-level delay between
+    trial-on and the touch window) is estimated from the data itself and
+    refined trial-to-trial to track slow clock drift, not assumed constant.
+    Tries bootstrapping the walk starting at trialOnT index 0..max_bootstrap_shift
+    in case the very first trial(s) were themselves aborted.
+
+    Returns a NEW touchDict (shallow copy, with a new seshParams dict holding
+    new trimmed arrays for the affected keys) with:
+      - seshParams['trialOnT'] trimmed to just the matched/touched trials, in
+        the same order as zF_touchMat's rows.
+      - Any other seshParams array whose length equals the ORIGINAL trialOnT
+        length is trimmed the same way (best-effort; arrays with a different
+        length, e.g. from an unrelated dropout pattern, are left untouched and
+        a warning is printed).
+      - seshParams['sourceTrialIds'] = the kept indices into the ORIGINAL
+        (untrimmed) trialOnT, so you can trace each row back to the raw trial.
+
+    Raises ValueError if trialOnT already matches the imaging trial count (no
+    fix needed) or if the touch/rxn arrays can't be fully accounted for by the
+    matching procedure (rather than silently guessing).
+    """
+    sp = touchDict['seshParams']
+    trialOnT = np.asarray(sp['trialOnT'])
+    n_trialOnT = len(trialOnT)
+
+    touchT = np.asarray(touchDict[touch_key])
+    rxnT = np.asarray(touchDict[rxn_key])
+    if len(touchT) != len(rxnT):
+        raise ValueError(f"'{touch_key}' (len {len(touchT)}) and '{rxn_key}' "
+                          f"(len {len(rxnT)}) have different lengths -- can't match.")
+
+    if n_trialOnT == len(touchT):
+        raise ValueError(
+            f"seshParams['trialOnT'] already has {n_trialOnT} entries, matching "
+            f"'{touch_key}' -- no aborted-trial mismatch to resolve here."
+        )
+
+    matched_idx = None
+    for start in range(min(max_bootstrap_shift, n_trialOnT) + 1):
+        matched_idx = _match_trialOnT_to_touches(trialOnT, touchT, rxnT, tol, start=start)
+        if matched_idx is not None:
+            break
+
+    if matched_idx is None:
+        raise ValueError(
+            f"Could not match all {len(touchT)} entries of '{touch_key}' to "
+            f"seshParams['trialOnT'] ({n_trialOnT} entries) via trialOnT + baseline "
+            f"+ {rxn_key} within tol={tol}s, even allowing up to "
+            f"{max_bootstrap_shift} leading aborted trials. The touch/reaction "
+            "time data may not follow the assumed relationship for this session -- "
+            "inspect manually rather than trust an automatic fix."
+        )
+
+    print(f"[organise_touch_trials] resolve_aborted_trials: matched {len(matched_idx)}/"
+          f"{n_trialOnT} trialOnT entries to '{touch_key}' -- treating the other "
+          f"{n_trialOnT - len(matched_idx)} as aborted trials (indices "
+          f"{np.setdiff1d(np.arange(n_trialOnT), matched_idx).tolist()}) and dropping them.")
+
+    new_sp = dict(sp)
+    for key, val in sp.items():
+        if _is_per_trial_array(val, n_trialOnT):
+            if key == 'trialOnT' or len(np.asarray(val)) == n_trialOnT:
+                new_sp[key] = np.asarray(val)[matched_idx]
+            else:
+                print(f"[organise_touch_trials] resolve_aborted_trials: leaving "
+                      f"seshParams['{key}'] untouched (length {len(np.asarray(val))} "
+                      f"doesn't match original trialOnT length {n_trialOnT}).")
+    new_sp['sourceTrialIds'] = matched_idx
+
+    new_touchDict = dict(touchDict)
+    new_touchDict['seshParams'] = new_sp
+    return new_touchDict
 
 
 def safe_index_meta(arr: np.ndarray, idx: np.ndarray, n_trials: int, name: str) -> np.ndarray:
@@ -359,22 +572,46 @@ def merge_touchDicts(touchDicts: list, labels: Optional[list] = None,
                 )
 
     # --- npix: union of unit IDs, re-index each dict's unit axis onto that union ---
-    unit_ids_list = [np.asarray(sp['npixUnitIds']) for sp in sps]
-    union_ids = np.unique(np.concatenate(unit_ids_list))
+    have_unit_ids = all('npixUnitIds' in sp for sp in sps)
 
-    npix_list = []
-    for lbl, d, n_trials, unit_ids in zip(labels, touchDicts, n_trials_list, unit_ids_list):
-        arr = np.asarray(d[npix_key])
-        arr = move_to_front(arr, find_trial_axis(arr, n_trials))  # -> (trial, ?, ?)
-        unit_ax = [ax for ax in (1, 2) if arr.shape[ax] == len(unit_ids)]
-        if len(unit_ax) != 1:
-            raise ValueError(
-                f"Could not uniquely identify the npix unit axis for '{lbl}' (post-trial "
-                f"shape {arr.shape[1:]}, expected one axis of length {len(unit_ids)} "
-                "matching seshParams['npixUnitIds'])."
-            )
-        npix_list.append(align_npix_units(arr, unit_ids, union_ids, unit_axis=unit_ax[0]))
-    npix_merged = np.concatenate(npix_list, axis=0)
+    if have_unit_ids:
+        unit_ids_list = [np.asarray(sp['npixUnitIds']) for sp in sps]
+        union_ids = np.unique(np.concatenate(unit_ids_list))
+
+        npix_list = []
+        for lbl, d, n_trials, unit_ids in zip(labels, touchDicts, n_trials_list, unit_ids_list):
+            arr = np.asarray(d[npix_key])
+            arr = move_to_front(arr, find_trial_axis(arr, n_trials))  # -> (trial, ?, ?)
+            unit_ax = [ax for ax in (1, 2) if arr.shape[ax] == len(unit_ids)]
+            if len(unit_ax) != 1:
+                raise ValueError(
+                    f"Could not uniquely identify the npix unit axis for '{lbl}' (post-trial "
+                    f"shape {arr.shape[1:]}, expected one axis of length {len(unit_ids)} "
+                    "matching seshParams['npixUnitIds'])."
+                )
+            npix_list.append(align_npix_units(arr, unit_ids, union_ids, unit_axis=unit_ax[0]))
+        npix_merged = np.concatenate(npix_list, axis=0)
+    else:
+        # No npixUnitIds anywhere (e.g. npix_touchMat is a fixed touch-pixel/channel
+        # signal rather than spike-sorted units) -- can't align by ID, so assume the
+        # channel axis is already positionally consistent across dicts and just
+        # check the post-trial shapes match before concatenating on the trial axis.
+        print("[organise_touch_trials] WARNING: seshParams['npixUnitIds'] missing -- "
+              "assuming npix channel axis is already positionally aligned across "
+              "touchDicts (no ID-based re-indexing).")
+        npix_raw = []
+        for d, n_trials in zip(touchDicts, n_trials_list):
+            arr = np.asarray(d[npix_key])
+            npix_raw.append(move_to_front(arr, find_trial_axis(arr, n_trials)))
+        ref_npix_shape = npix_raw[0].shape[1:]
+        for lbl, arr in zip(labels, npix_raw):
+            if arr.shape[1:] != ref_npix_shape:
+                raise ValueError(
+                    f"'{npix_key}' shape mismatch across touchDicts to merge and no "
+                    f"'npixUnitIds' available to align by unit ID: '{labels[0]}' has "
+                    f"{ref_npix_shape}, '{lbl}' has {arr.shape[1:]}."
+                )
+        npix_merged = np.concatenate(npix_raw, axis=0)
 
     # --- trialTypeInds: merge keys, offsetting each dict's local trial indices ---
     offsets = np.cumsum([0] + n_trials_list[:-1])
@@ -405,7 +642,8 @@ def merge_touchDicts(touchDicts: list, labels: Optional[list] = None,
     merged_sp['sourceLabel'] = np.concatenate([
         np.full(n, lbl, dtype=object) for lbl, n in zip(labels, n_trials_list)
     ])
-    merged_sp['npixUnitIds'] = union_ids
+    if have_unit_ids:
+        merged_sp['npixUnitIds'] = union_ids
 
     merged = {
         'seshParams': merged_sp,
@@ -466,6 +704,11 @@ class organisedDataset:
     # axis -- NOT per-trial. length should equal zF.shape[-1] (n_neurons).
     neuron_zone: Optional[np.ndarray] = field(default=None, repr=False)
 
+    # per-neuron source-animal label, aligned to zF's / npix_ds's feature axis
+    # respectively -- only set by build_pseudopopulation(), None otherwise.
+    neuron_mouse_zF: Optional[np.ndarray] = field(default=None, repr=False)
+    neuron_mouse_npix: Optional[np.ndarray] = field(default=None, repr=False)
+
     # populated only if pynapple is used (see build_pynapple_view)
     tsdtensor_zF: Optional["nap.TsdTensor"] = field(default=None, repr=False)
     tsdtensor_npix: Optional["nap.TsdTensor"] = field(default=None, repr=False)
@@ -521,6 +764,49 @@ class organisedDataset:
             trialOnT=np.concatenate([c.trialOnT for c in conds]),
         )
 
+    def pooled_dataset(self, pool_map: dict) -> "organisedDataset":
+        """
+        Like pool(), but returns a new organisedDataset containing just the
+        pooled conditions, instead of a single ConditionData -- e.g. so each
+        mouse's own 1port+2port sub-conditions can be pooled into one bigger
+        "Left Cor"/"Right Cor" BEFORE combining several mice's datasets with
+        build_pseudopopulation (which matches by condition name and would
+        otherwise cap the combined trial count at whichever mouse has the
+        FEWEST trials in the narrowest sub-condition).
+
+        pool_map : {new_name: [old_cond_names]}, e.g.
+            {"Left Cor": ["iCueL_1port_cor", "iCueL_2port_cor"],
+             "Right Cor": ["iCueR_1port_cor", "iCueR_2port_cor"]}
+
+        Carries over this dataset's time_zF/time_npix_ds/seshParams/
+        neuron_zone/neuron_mouse_zF/neuron_mouse_npix unchanged (pooling only
+        concatenates along the trial axis, not the neuron axis).
+        """
+        conditions = {new_name: self.pool(old_names, name=new_name) for new_name, old_names in pool_map.items()}
+        return organisedDataset(
+            conditions=conditions,
+            time_zF=self.time_zF,
+            time_npix_ds=self.time_npix_ds,
+            seshParams=self.seshParams,
+            neuron_zone=self.neuron_zone,
+            neuron_mouse_zF=self.neuron_mouse_zF,
+            neuron_mouse_npix=self.neuron_mouse_npix,
+        )
+
+    def zF_by_mouse(self, cond_name: str, mouse) -> np.ndarray:
+        """zF for one condition, restricted to neurons contributed by `mouse` (see neuron_mouse_zF)."""
+        if self.neuron_mouse_zF is None:
+            raise ValueError("No neuron_mouse_zF available (only set by build_pseudopopulation).")
+        mask = np.asarray(self.neuron_mouse_zF) == mouse
+        return self.conditions[cond_name].zF[:, :, mask]
+
+    def npix_by_mouse(self, cond_name: str, mouse) -> np.ndarray:
+        """npix_ds for one condition, restricted to neurons contributed by `mouse` (see neuron_mouse_npix)."""
+        if self.neuron_mouse_npix is None:
+            raise ValueError("No neuron_mouse_npix available (only set by build_pseudopopulation).")
+        mask = np.asarray(self.neuron_mouse_npix) == mouse
+        return self.conditions[cond_name].npix_ds[:, :, mask]
+
     def summary(self):
         for name, cond in self.conditions.items():
             print(f"{name:20s} n_trials={len(cond.trial_idx):4d}  zF={cond.zF.shape}  npix_ds={cond.npix_ds.shape}")
@@ -529,6 +815,12 @@ class organisedDataset:
             print(f"neuron_zone: {dict(zip(zones.tolist(), counts.tolist()))}")
         else:
             print("neuron_zone: not available")
+        if self.neuron_mouse_zF is not None:
+            mice, counts = np.unique(self.neuron_mouse_zF, return_counts=True)
+            print(f"neuron_mouse_zF: {dict(zip(mice.tolist(), counts.tolist()))}")
+        if self.neuron_mouse_npix is not None:
+            mice, counts = np.unique(self.neuron_mouse_npix, return_counts=True)
+            print(f"neuron_mouse_npix: {dict(zip(mice.tolist(), counts.tolist()))}")
 
 
 def organise_dataset(touchDict: dict, window: Optional[tuple] = None,
@@ -550,9 +842,16 @@ def organise_dataset(touchDict: dict, window: Optional[tuple] = None,
     trialOnT = np.asarray(sp['trialOnT'])
     n_trials = len(trialOnT)
 
-    cueSide = np.asarray(sp['cueSide'])
-    portSide = np.asarray(sp['portSide'])
-    rewardSide = np.asarray(sp['rewardSide'])
+    needs_derived = any(k not in sp for k in ('cueSide', 'portSide', 'rewardSide'))
+    derived_cue = derived_port = derived_reward = None
+    if needs_derived:
+        derived_cue, derived_port, derived_reward = derive_side_meta_from_trialTypeInds(
+            touchDict.get('trialTypeInds', {}), n_trials
+        )
+
+    cueSide = get_optional_meta(sp, 'cueSide', n_trials, derived=derived_cue)
+    portSide = get_optional_meta(sp, 'portSide', n_trials, derived=derived_port)
+    rewardSide = get_optional_meta(sp, 'rewardSide', n_trials, derived=derived_reward)
 
     zF = np.asarray(touchDict[zF_key])
     npixMat = np.asarray(touchDict[npix_key])
@@ -570,6 +869,7 @@ def organise_dataset(touchDict: dict, window: Optional[tuple] = None,
     time_zF = build_time_axis(sp, n_time_zF, window=window) # should span -2 to 2 seconds in 120 steps
 
     # downsample npix's time axis (now axis=1 after canonicalization) onto n_time_zF samples
+    npixMat = npixMat/100
     npix_ds = downsample_along_axis(npixMat, axis=1, target_n=n_time_zF)
     time_npix_ds = time_zF  # same grid post-downsample
 
@@ -609,5 +909,128 @@ def organise_dataset(touchDict: dict, window: Optional[tuple] = None,
         time_npix_ds=time_npix_ds,
         seshParams=sp,
         neuron_zone=neuron_zone,
+    )
+
+
+# --------------------------------------------------------------------------
+# Combining DIFFERENT animals/sessions into one pseudo-population
+# --------------------------------------------------------------------------
+
+def build_pseudopopulation(datasets: list, labels: Optional[list] = None,
+                            random_state: Optional[int] = None) -> organisedDataset:
+    """
+    Combine organisedDatasets from DIFFERENT animals/sessions into one
+    pseudo-population organisedDataset, matched by condition label (e.g.
+    'iCueR_1port_cor'). Unlike merge_touchDicts (same animal, real
+    simultaneously-recorded neurons, real trial concatenation), each dataset
+    here has its own unrelated set of neurons -- there's no such thing as
+    "the same trial" across animals, so neurons can't be concatenated along
+    the trial axis. Instead, per condition:
+
+      - each dataset's neuron axis is kept as its own block and concatenated
+        side-by-side into one combined feature axis (a "pseudo-population").
+      - trials are fabricated: each dataset's real trials for that condition
+        are independently shuffled and truncated to
+        min(n_trials across datasets that have this condition), then zipped
+        index-by-index into "pseudo-trials" -- e.g. pseudo-trial 3 pairs a
+        random real trial from mouse A with a random real trial from mouse
+        B. This is the standard way to build a population out of
+        non-simultaneously-recorded neurons for CCA/PCA/decoding (see e.g.
+        Kobak et al. 2016; Semedo et al. 2019); it assumes trial order
+        within a condition carries no meaning worth preserving across
+        animals.
+      - a dataset with ZERO trials in some condition contributes an all-NaN
+        block for that condition's pseudo-trials, rather than dropping the
+        condition entirely -- consistent with how missing npixUnitIds are
+        handled in merge_touchDicts. finite_feature_mask (used before
+        CCA/PCA fitting, see CCA_analysis.py) drops those columns
+        automatically downstream.
+
+    All datasets must share the same time_zF axis (same window/n_points --
+    pass the same `window=` to organise_dataset for every mouse) since
+    there's no meaningful way to combine mismatched time axes.
+
+    Per-trial metadata (trialOnT, cueSide/portSide/rewardSide) has no
+    coherent value for a fabricated pseudo-trial pairing two unrelated real
+    trials, so cueSide/portSide/rewardSide are instead derived once from the
+    condition name itself (parse_condition_name) -- valid for every
+    contributing animal by construction -- and trialOnT is left as NaN.
+
+    Returns an organisedDataset whose neuron_zone (if every input dataset
+    has one) is the concatenation of each dataset's neuron_zone in the same
+    order the feature axis was built, and whose neuron_mouse_zF /
+    neuron_mouse_npix record which `labels` entry each neuron in the
+    combined zF / npix_ds axis came from (see zF_by_mouse/npix_by_mouse).
+    """
+    if len(datasets) < 2:
+        raise ValueError("build_pseudopopulation needs at least 2 datasets.")
+    if labels is None:
+        labels = [d.seshParams.get('mouse', f'dataset{i}') for i, d in enumerate(datasets)]
+
+    ref_time = datasets[0].time_zF
+    for lbl, d in zip(labels, datasets):
+        if d.time_zF.shape != ref_time.shape or not np.allclose(d.time_zF, ref_time):
+            raise ValueError(
+                f"time_zF differs at '{lbl}' relative to '{labels[0]}' -- pass the same "
+                "`window=` to organise_dataset for every dataset being combined."
+            )
+    n_time = len(ref_time)
+
+    # per-dataset neuron counts -- constant across that dataset's own conditions
+    # regardless of trial count, so any condition (even an empty one) works.
+    n_zF = [next(iter(d.conditions.values())).zF.shape[-1] for d in datasets]
+    n_npix = [next(iter(d.conditions.values())).npix_ds.shape[-1] for d in datasets]
+
+    have_zone = all(d.neuron_zone is not None for d in datasets)
+    neuron_zone = np.concatenate([d.neuron_zone for d in datasets]) if have_zone else None
+    if not have_zone and any(d.neuron_zone is not None for d in datasets):
+        print("[organise_touch_trials] WARNING: not every dataset has neuron_zone -- "
+              "combined organisedDataset.neuron_zone left unset.")
+    neuron_mouse_zF = np.concatenate([np.full(n, lbl, dtype=object) for lbl, n in zip(labels, n_zF)])
+    neuron_mouse_npix = np.concatenate([np.full(n, lbl, dtype=object) for lbl, n in zip(labels, n_npix)])
+
+    rng = np.random.default_rng(random_state)
+    cond_names = sorted({name for d in datasets for name in d.keys()})
+
+    conditions = {}
+    for cond_name in cond_names:
+        contributor_counts = [len(d[cond_name].trial_idx) for d in datasets
+                               if cond_name in d.keys() and len(d[cond_name].trial_idx) > 0]
+        if not contributor_counts:
+            continue
+        n_pseudo = min(contributor_counts)
+
+        zF_chunks, npix_chunks = [], []
+        for d, n_zF_i, n_npix_i in zip(datasets, n_zF, n_npix):
+            has_cond = cond_name in d.keys() and len(d[cond_name].trial_idx) > 0
+            if has_cond:
+                idx = rng.permutation(len(d[cond_name].trial_idx))[:n_pseudo]
+                zF_chunks.append(d[cond_name].zF[idx])
+                npix_chunks.append(d[cond_name].npix_ds[idx])
+            else:
+                zF_chunks.append(np.full((n_pseudo, n_time, n_zF_i), np.nan))
+                npix_chunks.append(np.full((n_pseudo, n_time, n_npix_i), np.nan))
+
+        parsed = parse_condition_name(cond_name) or {}
+        conditions[cond_name] = ConditionData(
+            name=cond_name,
+            trial_idx=np.arange(n_pseudo),
+            zF=np.concatenate(zF_chunks, axis=-1),
+            npix_ds=np.concatenate(npix_chunks, axis=-1),
+            cueSide=np.full(n_pseudo, parsed.get('cueSide')),
+            portSide=np.full(n_pseudo, parsed.get('portSide')),
+            rewardSide=np.full(n_pseudo, parsed.get('rewardSide')),
+            trialOnT=np.full(n_pseudo, np.nan),
+        )
+
+    return organisedDataset(
+        conditions=conditions,
+        time_zF=ref_time,
+        time_npix_ds=ref_time,
+        seshParams={'mouse': 'pseudopopulation(' + ','.join(map(str, labels)) + ')',
+                    'sourceLabels': list(labels)},
+        neuron_zone=neuron_zone,
+        neuron_mouse_zF=neuron_mouse_zF,
+        neuron_mouse_npix=neuron_mouse_npix,
     )
 
